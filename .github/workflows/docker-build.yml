@@ -4,8 +4,8 @@ on:
   workflow_dispatch:  # Manual trigger
   release:
     types: [published]  # Trigger on releases
-  # schedule:
-  #   - cron: '0 0 * * *'  # Daily check for upstream releases
+    schedule:
+      - cron: '0 0 * * *'  # Daily check for upstream releases
 
 jobs:
   check-and-build:
