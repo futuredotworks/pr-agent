@@ -10,14 +10,16 @@ from typing import Dict, List
 
 from jinja2 import Environment, StrictUndefined
 
+from pr_agent.algo import MAX_TOKENS
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+from pr_agent.algo.git_patch_processing import decouple_and_convert_to_hunks_with_lines_numbers
 from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
                                          get_pr_diff, get_pr_multi_diffs,
                                          retry_with_fallback_models)
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import (ModelType, load_yaml, replace_code_tags,
-                                 show_relevant_configurations)
+                                 show_relevant_configurations, get_max_tokens, clip_tokens, get_model)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import (AzureDevopsProvider, GithubProvider,
                                     GitLabProvider, get_git_provider,
@@ -37,21 +39,7 @@ class PRCodeSuggestions:
             self.git_provider.get_languages(), self.git_provider.get_files()
         )
 
-        # limit context specifically for the improve command, which has hard input to parse:
-        if get_settings().pr_code_suggestions.max_context_tokens:
-            MAX_CONTEXT_TOKENS_IMPROVE = get_settings().pr_code_suggestions.max_context_tokens
-            if get_settings().config.max_model_tokens > MAX_CONTEXT_TOKENS_IMPROVE:
-                get_logger().info(f"Setting max_model_tokens to {MAX_CONTEXT_TOKENS_IMPROVE} for PR improve")
-                get_settings().config.max_model_tokens_original = get_settings().config.max_model_tokens
-                get_settings().config.max_model_tokens = MAX_CONTEXT_TOKENS_IMPROVE
-
-        # extended mode
-        try:
-            self.is_extended = self._get_is_extended(args or [])
-        except:
-            self.is_extended = False
         num_code_suggestions = int(get_settings().pr_code_suggestions.num_code_suggestions_per_chunk)
-
 
         self.ai_handler = ai_handler()
         self.ai_handler.main_pr_language = self.main_language
@@ -85,12 +73,18 @@ class PRCodeSuggestions:
             "date": datetime.now().strftime('%Y-%m-%d'),
             'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False),
         }
-        self.pr_code_suggestions_prompt_system = get_settings().pr_code_suggestions_prompt.system
+
+        if get_settings().pr_code_suggestions.get("decouple_hunks", True):
+            self.pr_code_suggestions_prompt_system = get_settings().pr_code_suggestions_prompt.system
+            self.pr_code_suggestions_prompt_user = get_settings().pr_code_suggestions_prompt.user
+        else:
+            self.pr_code_suggestions_prompt_system = get_settings().pr_code_suggestions_prompt_not_decoupled.system
+            self.pr_code_suggestions_prompt_user = get_settings().pr_code_suggestions_prompt_not_decoupled.user
 
         self.token_handler = TokenHandler(self.git_provider.pr,
                                           self.vars,
                                           self.pr_code_suggestions_prompt_system,
-                                          get_settings().pr_code_suggestions_prompt.user)
+                                          self.pr_code_suggestions_prompt_user)
 
         self.progress = f"## Generating PR code suggestions\n\n"
         self.progress += f"""\nWork in progress ...<br>\n<img src="https://codium.ai/images/pr_agent/dual_ball_loading-crop.gif" width=48>"""
@@ -115,11 +109,11 @@ class PRCodeSuggestions:
                 else:
                     self.git_provider.publish_comment("Preparing suggestions...", is_temporary=True)
 
-            # call the model to get the suggestions, and self-reflect on them
-            if not self.is_extended:
-                data = await retry_with_fallback_models(self._prepare_prediction, model_type=ModelType.REGULAR)
-            else:
-                data = await retry_with_fallback_models(self._prepare_prediction_extended, model_type=ModelType.REGULAR)
+            # # call the model to get the suggestions, and self-reflect on them
+            # if not self.is_extended:
+            #     data = await retry_with_fallback_models(self._prepare_prediction, model_type=ModelType.REGULAR)
+            # else:
+            data = await retry_with_fallback_models(self.prepare_prediction_main, model_type=ModelType.REGULAR)
             if not data:
                 data = {"code_suggestions": []}
             self.data = data
@@ -215,7 +209,8 @@ class PRCodeSuggestions:
 
     async def publish_no_suggestions(self):
         pr_body = "## PR Code Suggestions ✨\n\nNo code suggestions found for the PR."
-        if get_settings().config.publish_output and get_settings().config.publish_output_no_suggestions:
+        if (get_settings().config.publish_output and
+                get_settings().pr_code_suggestions.get('publish_output_no_suggestions', True)):
             get_logger().warning('No code suggestions found for the PR.')
             get_logger().debug(f"PR output", artifact=pr_body)
             if self.progress_response:
@@ -263,14 +258,6 @@ class PRCodeSuggestions:
             if match:
                 up_to_commit_txt = f" up to commit {match.group(0)[4:-3].strip()}"
             return up_to_commit_txt
-
-        if isinstance(git_provider, AzureDevopsProvider): # get_latest_commit_url is not supported yet
-            if progress_response:
-                git_provider.edit_comment(progress_response, pr_comment)
-                new_comment = progress_response
-            else:
-                new_comment = git_provider.publish_comment(pr_comment)
-            return new_comment
 
         history_header = f"#### Previous suggestions\n"
         last_commit_num = git_provider.get_latest_commit_url().split('/')[-1][:7]
@@ -413,9 +400,15 @@ class PRCodeSuggestions:
         data = self._prepare_pr_code_suggestions(response)
 
         # self-reflect on suggestions (mandatory, since line numbers are generated now here)
-        model_reflection = get_settings().config.model
+        model_reflect_with_reasoning = get_model('model_reasoning')
+        fallbacks = get_settings().config.fallback_models
+        if model_reflect_with_reasoning == get_settings().config.model and model != get_settings().config.model and fallbacks and model == \
+                fallbacks[0]:
+            # we are using a fallback model (should not happen on regular conditions)
+            get_logger().warning(f"Using the same model for self-reflection as the one used for suggestions")
+            model_reflect_with_reasoning = model
         response_reflect = await self.self_reflect_on_suggestions(data["code_suggestions"],
-                                                                  patches_diff, model=model_reflection)
+                                                                  patches_diff, model=model_reflect_with_reasoning)
         if response_reflect:
             await self.analyze_self_reflection_response(data, response_reflect)
         else:
@@ -465,6 +458,8 @@ class PRCodeSuggestions:
                                                  "code_suggestions_feedback": code_suggestions_feedback[i]})
                     suggestion["score"] = 7
                     suggestion["score_why"] = ""
+
+                suggestion = self.validate_one_liner_suggestion_not_repeating_code(suggestion)
 
                 # if the before and after code is the same, clear one of them
                 try:
@@ -611,25 +606,44 @@ class PRCodeSuggestions:
                     break
             if original_initial_line:
                 suggested_initial_line = new_code_snippet.splitlines()[0]
-                original_initial_spaces = len(original_initial_line) - len(original_initial_line.lstrip())
+                original_initial_spaces = len(original_initial_line) - len(original_initial_line.lstrip()) # lstrip works both for spaces and tabs
                 suggested_initial_spaces = len(suggested_initial_line) - len(suggested_initial_line.lstrip())
                 delta_spaces = original_initial_spaces - suggested_initial_spaces
                 if delta_spaces > 0:
-                    new_code_snippet = textwrap.indent(new_code_snippet, delta_spaces * " ").rstrip('\n')
+                    # Detect indentation character from original line
+                    indent_char = '\t' if original_initial_line.startswith('\t') else ' '
+                    new_code_snippet = textwrap.indent(new_code_snippet, delta_spaces * indent_char).rstrip('\n')
         except Exception as e:
             get_logger().error(f"Error when dedenting code snippet for file {relevant_file}, error: {e}")
 
         return new_code_snippet
 
-    def _get_is_extended(self, args: list[str]) -> bool:
-        """Check if extended mode should be enabled by the `--extended` flag or automatically according to the configuration"""
-        if any(["extended" in arg for arg in args]):
-            get_logger().info("Extended mode is enabled by the `--extended` flag")
-            return True
-        if get_settings().pr_code_suggestions.auto_extended_mode:
-            # get_logger().info("Extended mode is enabled automatically based on the configuration toggle")
-            return True
-        return False
+    def validate_one_liner_suggestion_not_repeating_code(self, suggestion):
+        try:
+            existing_code = suggestion.get('existing_code', '').strip()
+            if '...' in existing_code:
+                return suggestion
+            new_code = suggestion.get('improved_code', '').strip()
+
+            relevant_file = suggestion.get('relevant_file', '').strip()
+            diff_files = self.git_provider.get_diff_files()
+            for file in diff_files:
+                if file.filename.strip() == relevant_file:
+                    # protections
+                    if not file.head_file:
+                        get_logger().info(f"head_file is empty")
+                        return suggestion
+                    head_file = file.head_file
+                    base_file = file.base_file
+                    if existing_code in base_file and existing_code not in head_file and new_code in head_file:
+                        suggestion["score"] = 0
+                        get_logger().warning(
+                            f"existing_code is in the base file but not in the head file, setting score to 0",
+                            artifact={"suggestion": suggestion})
+        except Exception as e:
+            get_logger().exception(f"Error validating one-liner suggestion", artifact={"error": e})
+
+        return suggestion
 
     def remove_line_numbers(self, patches_diff_list: List[str]) -> List[str]:
         # create a copy of the patches_diff_list, without line numbers for '__new hunk__' sections
@@ -653,12 +667,32 @@ class PRCodeSuggestions:
             get_logger().error(f"Error removing line numbers from patches_diff_list, error: {e}")
             return patches_diff_list
 
-    async def _prepare_prediction_extended(self, model: str) -> dict:
-        self.patches_diff_list = get_pr_multi_diffs(self.git_provider, self.token_handler, model,
-                                                    max_calls=get_settings().pr_code_suggestions.max_number_of_calls)
+    async def prepare_prediction_main(self, model: str) -> dict:
+        # get PR diff
+        if get_settings().pr_code_suggestions.decouple_hunks:
+            self.patches_diff_list = get_pr_multi_diffs(self.git_provider,
+                                                        self.token_handler,
+                                                        model,
+                                                        max_calls=get_settings().pr_code_suggestions.max_number_of_calls,
+                                                        add_line_numbers=True)  # decouple hunk with line numbers
+            self.patches_diff_list_no_line_numbers = self.remove_line_numbers(self.patches_diff_list)  # decouple hunk
 
-        # create a copy of the patches_diff_list, without line numbers for '__new hunk__' sections
-        self.patches_diff_list_no_line_numbers = self.remove_line_numbers(self.patches_diff_list)
+        else:
+            # non-decoupled hunks
+            self.patches_diff_list_no_line_numbers = get_pr_multi_diffs(self.git_provider,
+                                                                        self.token_handler,
+                                                                        model,
+                                                                        max_calls=get_settings().pr_code_suggestions.max_number_of_calls,
+                                                                        add_line_numbers=False)
+            self.patches_diff_list = await self.convert_to_decoupled_with_line_numbers(
+                self.patches_diff_list_no_line_numbers, model)
+            if not self.patches_diff_list:
+                # fallback to decoupled hunks
+                self.patches_diff_list = get_pr_multi_diffs(self.git_provider,
+                                                            self.token_handler,
+                                                            model,
+                                                            max_calls=get_settings().pr_code_suggestions.max_number_of_calls,
+                                                            add_line_numbers=True)  # decouple hunk with line numbers
 
         if self.patches_diff_list:
             get_logger().info(f"Number of PR chunk calls: {len(self.patches_diff_list)}")
@@ -699,6 +733,42 @@ class PRCodeSuggestions:
             self.data = data = None
         return data
 
+    async def convert_to_decoupled_with_line_numbers(self, patches_diff_list_no_line_numbers, model) -> List[str]:
+        with get_logger().contextualize(sub_feature='convert_to_decoupled_with_line_numbers'):
+            try:
+                patches_diff_list = []
+                for patch_prompt in patches_diff_list_no_line_numbers:
+                    file_prefix = "## File: "
+                    patches = patch_prompt.strip().split(f"\n{file_prefix}")
+                    patches_new = copy.deepcopy(patches)
+                    for i in range(len(patches_new)):
+                        if i == 0:
+                            prefix = patches_new[i].split("\n@@")[0].strip()
+                        else:
+                            prefix = file_prefix + patches_new[i].split("\n@@")[0][1:]
+                            prefix = prefix.strip()
+                        patches_new[i] = prefix + '\n\n' + decouple_and_convert_to_hunks_with_lines_numbers(patches_new[i],
+                                                                                                          file=None).strip()
+                        patches_new[i] = patches_new[i].strip()
+                    patch_final = "\n\n\n".join(patches_new)
+                    if model in MAX_TOKENS:
+                        max_tokens_full = MAX_TOKENS[
+                            model]  # note - here we take the actual max tokens, without any reductions. we do aim to get the full documentation website in the prompt
+                    else:
+                        max_tokens_full = get_max_tokens(model)
+                    delta_output = 2000
+                    token_count = self.token_handler.count_tokens(patch_final)
+                    if token_count > max_tokens_full - delta_output:
+                        get_logger().warning(
+                            f"Token count {token_count} exceeds the limit {max_tokens_full - delta_output}. clipping the tokens")
+                        patch_final = clip_tokens(patch_final, max_tokens_full - delta_output)
+                    patches_diff_list.append(patch_final)
+                return patches_diff_list
+            except Exception as e:
+                get_logger().exception(f"Error converting to decoupled with line numbers",
+                                       artifact={'patches_diff_list_no_line_numbers': patches_diff_list_no_line_numbers})
+                return []
+
     def generate_summarized_suggestions(self, data: Dict) -> str:
         try:
             pr_body = "## PR Code Suggestions ✨\n\n"
@@ -707,7 +777,7 @@ class PRCodeSuggestions:
                 pr_body += "No suggestions found to improve this PR."
                 return pr_body
 
-            if get_settings().pr_code_suggestions.enable_intro_text and get_settings().config.is_auto_command:
+            if get_settings().config.is_auto_command:
                 pr_body += "Explore these optional code suggestions:\n\n"
 
             language_extension_map_org = get_settings().language_extension_map_org
@@ -866,6 +936,7 @@ class PRCodeSuggestions:
             with get_logger().contextualize(command="self_reflect_on_suggestions"):
                 response_reflect, finish_reason_reflect = await self.ai_handler.chat_completion(model=model,
                                                                                                 system=system_prompt_reflect,
+                                                                                                temperature=get_settings().config.temperature,
                                                                                                 user=user_prompt_reflect)
         except Exception as e:
             get_logger().info(f"Could not reflect on suggestions, error: {e}")
